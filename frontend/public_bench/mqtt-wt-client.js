@@ -4,7 +4,7 @@
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-// ----- MQTT helpers (mostly your existing code) -----
+// ----- MQTT helpers -----
 
 function encodeVarInt(n) {
   const bytes = [];
@@ -73,6 +73,9 @@ export class WebTransportMqttClient {
 
     // simple event emitter: connect, close, error, message, log, connack, suback
     this._events = new Map();
+
+    // buffer for reassembling MQTT packets from WebTransport stream
+    this._inBuf = new Uint8Array(0);
   }
 
   // --- public API (mqtt.js / Paho-ish) ---
@@ -166,6 +169,7 @@ export class WebTransportMqttClient {
     this.stream = null;
     this.writer = null;
     this.reader = null;
+    this._inBuf = new Uint8Array(0);
   }
 
   async _sendBinary(bytes) {
@@ -175,18 +179,62 @@ export class WebTransportMqttClient {
 
   async _startReadLoop() {
     try {
-      // eslint-disable-next-line no-constant-condition
       while (true) {
         const { value, done } = await this.reader.read();
         if (done) break;
         if (!value || !value.byteLength) continue;
-        this._parseIncoming(new Uint8Array(value));
+
+        const chunk = new Uint8Array(value);
+
+        // append chunk to buffer
+        const merged = new Uint8Array(this._inBuf.length + chunk.length);
+        merged.set(this._inBuf, 0);
+        merged.set(chunk, this._inBuf.length);
+        this._inBuf = merged;
+
+        // process as many full MQTT packets as we have buffered
+        this._processIncomingBuffer();
       }
     } catch (e) {
       this._emit('log', 'Read loop error:', e);
       this._emit('error', e);
     } finally {
       this._emit('log', 'Read loop finished');
+    }
+  }
+
+  _processIncomingBuffer() {
+    // We may have multiple full MQTT packets, or a partial one.
+    // MQTT packet format: [fixed header byte][Remaining Length varint][RL bytes of body]
+    // Remaining Length includes variable header + payload, but not the Fixed Header itself. :contentReference[oaicite:1]{index=1}
+    while (true) {
+      const buf = this._inBuf;
+      if (buf.length < 2) return; // need at least first byte + 1 RL byte
+
+      const { value: rl, consumed: rlBytes } = decodeVarInt(buf, 1);
+      if (rl == null || rlBytes === 0) {
+        // incomplete Remaining Length; wait for more data
+        return;
+      }
+
+      const totalLen = 1 + rlBytes + rl; // fixed header + RL bytes + body
+      if (buf.length < totalLen) {
+        // full packet not yet in buffer
+        return;
+      }
+
+      // slice out one full packet
+      const packet = buf.subarray(0, totalLen);
+      const rest = buf.subarray(totalLen);
+
+      // copy remaining bytes back into _inBuf
+      this._inBuf = new Uint8Array(rest.length);
+      this._inBuf.set(rest, 0);
+
+      // handle this packet
+      this._handlePacket(packet);
+
+      // loop again in case there's another packet already buffered
     }
   }
 
@@ -274,7 +322,7 @@ export class WebTransportMqttClient {
 
   // ----- MQTT parsing -----
 
-  _parseIncoming(buf) {
+  _handlePacket(buf) {
     if (buf.length < 2) return;
 
     const packetType = buf[0] >> 4;

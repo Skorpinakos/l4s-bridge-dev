@@ -17,7 +17,7 @@ const options = {
   key: fs.readFileSync(KEY)
 };
 
-const publicDir = path.join(__dirname, 'public');
+const publicDir = path.join(__dirname, 'public_bench');
 
 const mimeTypes = {
   '.html': 'text/html; charset=utf-8',
