@@ -1,0 +1,3 @@
+docker run -d --name l4s-bridge   --network emqx_default   -p 1027:1027/udp   -v /home/ubuntu/.acme-certs:/certs:ro   -e EMQX_HOST=emqx   -e EMQX_QUIC_PORT=14567   -e EMQX_SNI=nam5gxr.duckdns.org   l4s-bridge
+
+#TODO INCLUDE IN DOCKER-COMPOSE.YML ALONG WITH EMQX

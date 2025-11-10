@@ -1,0 +1,31 @@
+services:
+  emqx:
+    image: emqx/emqx:latest
+    container_name: emqx
+    restart: unless-stopped
+    ports:
+      - "1028:1883/tcp"     # MQTT -> 1883
+      - "1029:8084/tcp"     # WSS  -> 8084
+      - "1030:14567/udp"    # QUIC -> 14567
+    environment:
+      # disable default TLS-over-TCP listener
+      EMQX_LISTENERS__SSL__DEFAULT__ENABLED: "false"
+
+      # WSS with your certs
+      EMQX_LISTENERS__WSS__DEFAULT__ENABLED: "true"
+      EMQX_LISTENERS__WSS__DEFAULT__BIND: "0.0.0.0:8084"
+      EMQX_LISTENERS__WSS__DEFAULT__SSL_OPTIONS__KEYFILE: "/opt/emqx/etc/certs/privkey.pem"
+      EMQX_LISTENERS__WSS__DEFAULT__SSL_OPTIONS__CERTFILE: "/opt/emqx/etc/certs/fullchain.pem"
+      EMQX_LISTENERS__WSS__DEFAULT__SSL_OPTIONS__CACERTFILE: "/opt/emqx/etc/certs/fullchain.pem"
+
+      # QUIC with your certs (per docs: keyfile/certfile envs)
+      EMQX_LISTENERS__QUIC__DEFAULT__ENABLED: "true"
+      EMQX_LISTENERS__QUIC__DEFAULT__BIND: "0.0.0.0:14567"
+      EMQX_LISTENERS__QUIC__DEFAULT__keyfile: "/opt/emqx/etc/certs/privkey.pem"
+      EMQX_LISTENERS__QUIC__DEFAULT__certfile: "/opt/emqx/etc/certs/fullchain.pem"
+
+      # non-default cookie
+      EMQX_NODE__COOKIE: "please_change_me_cookie"
+    volumes:
+      - /home/ubuntu/.acme-certs:/opt/emqx/etc/certs:ro
+

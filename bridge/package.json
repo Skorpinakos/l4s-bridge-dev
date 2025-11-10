@@ -1,0 +1,15 @@
+{
+  "name": "l4s-quic-webtransport-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.mjs",
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "@fails-components/webtransport": "^1.4.4",
+    "@matrixai/quic": "^2.0.9",
+    "@peculiar/webcrypto": "^1.5.0",
+    "dotenv": "^16.4.0"
+  }
+}
