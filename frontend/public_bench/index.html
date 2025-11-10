@@ -15,7 +15,6 @@
         --accent-soft: rgba(79, 209, 197, 0.12);
         --text: #e5e7eb;
         --muted: #9ca3af;
-        --danger: #f97373;
       }
 
       body {
@@ -243,7 +242,7 @@
 
         <div class="stats">
           <div class="stat">
-            <span class="stat-label">Messages:</span>
+            <span class="stat-label">Messages (last 5s):</span>
             <span id="msgCount" class="stat-value">0</span>
           </div>
           <div class="stat">
@@ -251,18 +250,18 @@
             <span id="lastLatency" class="stat-value">–</span>
           </div>
           <div class="stat">
-            <span class="stat-label">Average latency:</span>
+            <span class="stat-label">Average latency (5s):</span>
             <span id="avgLatency" class="stat-value">–</span>
           </div>
           <div class="stat">
-            <span class="stat-label">Min / Max:</span>
+            <span class="stat-label">Min / Max (5s):</span>
             <span id="minMaxLatency" class="stat-value">–</span>
           </div>
         </div>
       </section>
 
       <section class="panel">
-        <h2>Latency timeline (arrival − ts, ms)</h2>
+        <h2>Latency timeline (last 3s, arrival − ts, corrected, ms)</h2>
         <canvas id="latencyCanvas" width="800" height="300"></canvas>
       </section>
     </main>

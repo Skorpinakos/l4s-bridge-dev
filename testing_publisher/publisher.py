@@ -7,10 +7,6 @@ import random
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 
-# Load configuration from .env in the same folder
-# Expected keys (with sensible defaults):
-#   MQTT_HOST, MQTT_PORT, MQTT_TOPIC, MQTT_CLIENT_ID,
-#   MQTT_RATE_HZ, MQTT_USERNAME, MQTT_PASSWORD
 load_dotenv()
 
 MQTT_HOST = os.getenv("MQTT_HOST", "nam5gxr.duckdns.org")
@@ -25,81 +21,115 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 # QoS 0 = fire-and-forget
 QOS = 0
 
-# Interval between messages (seconds)
 INTERVAL = 1.0 / MQTT_RATE_HZ
+
+# Time sync topics (JS will use them)
+TIME_SYNC_REQ_TOPIC = os.getenv("TIME_SYNC_REQ_TOPIC", "time/sync/req")
+TIME_SYNC_RESP_TOPIC = os.getenv("TIME_SYNC_RESP_TOPIC", "time/sync/resp")
 
 cnt = 0
 
 
+def now_ms() -> int:
+  """Milliseconds since Unix epoch."""
+  return time.time_ns() // 1_000_000
+
+
 def on_connect(client, userdata, flags, reason_code, properties=None):
-    print(f"[on_connect] Connected to {MQTT_HOST}:{MQTT_PORT} rc={reason_code}")
+  print(f"[on_connect] Connected to {MQTT_HOST}:{MQTT_PORT} rc={reason_code}")
+  # Listen for time-sync requests from the browser
+  client.subscribe(TIME_SYNC_REQ_TOPIC, qos=0)
+
+
+def on_message(client, userdata, msg):
+  # Simple NTP-style time sync responder
+  if msg.topic != TIME_SYNC_REQ_TOPIC:
+    return
+
+  try:
+    data = json.loads(msg.payload.decode("utf-8"))
+    t1 = data.get("t1")
+    if not isinstance(t1, (int, float)):
+      return
+  except Exception:
+    return
+
+  # T2 = server receive, T3 = server send (keep code path tiny)
+  t2 = now_ms()
+  t3 = now_ms()
+
+  resp = {"t1": t1, "t2": t2, "t3": t3}
+  client.publish(
+    TIME_SYNC_RESP_TOPIC,
+    json.dumps(resp, separators=(",", ":")),
+    qos=0,
+    retain=False,
+  )
 
 
 def main():
-    global cnt
+  global cnt
 
-    # MQTT v5 client over TCP
-    client = mqtt.Client(
-        client_id=MQTT_CLIENT_ID,
-        protocol=mqtt.MQTTv5,
-        transport="tcp",
-    )
+  client = mqtt.Client(
+    client_id=MQTT_CLIENT_ID,
+    protocol=mqtt.MQTTv5,
+    transport="tcp",
+  )
 
-    client.on_connect = on_connect
+  client.on_connect = on_connect
+  client.on_message = on_message
 
-    if MQTT_USERNAME:
-        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+  if MQTT_USERNAME:
+    client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
 
-    print(f"Connecting to {MQTT_HOST}:{MQTT_PORT} ...")
-    client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+  print(f"Connecting to {MQTT_HOST}:{MQTT_PORT} ...")
+  client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
 
-    # Run network loop in background thread
-    client.loop_start()
+  # Run network loop in background thread
+  client.loop_start()
 
-    try:
-        next_send = time.time()
-        while True:
-            cnt += 1
+  try:
+    # Target time for next send (used for pacing only)
+    target_time = time.time()
 
-            # Milliseconds since Unix epoch – easy to compare with JS Date.now()
-            ts_ms = time.time_ns() // 1_000_000
+    while True:
+      cnt += 1
 
-            # Example geopose payload; replace with real sensors if you wish
-            payload = {
-                "cnt": cnt,
-                "ts": ts_ms,
-                "body": {
-                    "lon": 21.7300 + random.uniform(-0.0001, 0.0001),
-                    "lat": 38.2466 + random.uniform(-0.0001, 0.0001),
-                    "alt": 50.0 + random.uniform(-1.0, 1.0),
-                    "yaw": random.uniform(-180, 180),
-                    "pitch": random.uniform(-90, 90),
-                    "roll": random.uniform(-180, 180),
-                },
-            }
+      ts_ms = now_ms()  # send timestamp (server clock)
 
-            payload_str = json.dumps(payload, separators=(",", ":"))
+      payload = {
+        "cnt": cnt,
+        "ts": ts_ms,
+        "body": {
+          "lon": 21.7300 + random.uniform(-0.0001, 0.0001),
+          "lat": 38.2466 + random.uniform(-0.0001, 0.0001),
+          "alt": 50.0 + random.uniform(-1.0, 1.0),
+          "yaw": random.uniform(-180, 180),
+          "pitch": random.uniform(-90, 90),
+          "roll": random.uniform(-180, 180),
+        },
+      }
 
-            # Fire-and-forget publish
-            client.publish(MQTT_TOPIC, payload_str, qos=QOS, retain=False)
+      payload_str = json.dumps(payload, separators=(",", ":"))
 
-            # Simple rate control to target MQTT_RATE_HZ
-            next_send += INTERVAL
-            sleep_time = next_send - time.time()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                # We are lagging; reset schedule to avoid drift explosion
-                next_send = time.time()
-            if sleep_time>=0.05:
-                print(cnt)
-    except KeyboardInterrupt:
-        print("\nStopping publisher (Ctrl+C)…")
-    finally:
-        client.loop_stop()
-        client.disconnect()
-        print("Disconnected cleanly.")
+      client.publish(MQTT_TOPIC, payload_str, qos=QOS, retain=False)
+
+      # Pacing to target MQTT_RATE_HZ
+      target_time += INTERVAL
+      sleep_time = target_time - time.time()
+      if sleep_time > 0:
+        time.sleep(sleep_time)
+      else:
+        # We are lagging; reset to avoid drift explosion
+        target_time = time.time()
+
+  except KeyboardInterrupt:
+    print("\nStopping publisher (Ctrl+C)…")
+  finally:
+    client.loop_stop()
+    client.disconnect()
+    print("Disconnected cleanly.")
 
 
 if __name__ == "__main__":
-    main()
+  main()

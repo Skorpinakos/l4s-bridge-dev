@@ -1,5 +1,7 @@
 // main.js
-// Demo: subscribe to telemetry/geopose and plot (arrivalTime - payload.ts) in ms.
+// Telemetry demo: subscribe to telemetry/geopose, multi-probe time-sync to server
+// over MQTT, plot clock-corrected one-way latency.
+// Stats: last 5 seconds. Graph: last 3 seconds.
 
 import { WebTransportMqttClient } from './mqtt-wt-client.js';
 
@@ -15,24 +17,32 @@ const lastLatencyEl = document.getElementById('lastLatency');
 const avgLatencyEl = document.getElementById('avgLatency');
 const minMaxLatencyEl = document.getElementById('minMaxLatency');
 
-const canvas = document.getElementById('latencyCanvas');
-const ctx = canvas.getContext('2d');
+const latencyCanvas = document.getElementById('latencyCanvas');
+const latencyCtx = latencyCanvas.getContext('2d');
 
-// ----- State -----
-let client = null;
+// ----- Config -----
+
 const topic = 'telemetry/geopose';
 
-const maxPoints = 1000;
-const latencyPoints = []; // numbers (ms)
+// Time sync topics – must match the Python publisher
+const TIME_SYNC_REQ_TOPIC = 'time/sync/req';
+const TIME_SYNC_RESP_TOPIC = 'time/sync/resp';
 
-// global stats (over all samples seen)
-let count = 0;
-let sumLatency = 0;
-let minLatency = Infinity;
-let maxLatency = -Infinity;
-let lastLatencyMs = null;
+// Time windows (ms)
+const STATS_WINDOW_MS = 5000; // stats over last 5s
+const GRAPH_WINDOW_MS = 3000; // graph over last 3s
 
-// flag to batch DOM updates & drawing using requestAnimationFrame
+// ----- State -----
+
+let client = null;
+
+// server_time ≈ client_time + clockOffsetMs
+let clockOffsetMs = 0;
+
+// store (time, value) for latency samples
+const latencySamples = []; // { t: number, v: number }
+
+// Batch DOM/canvas updates via rAF
 let needsRender = true;
 
 // ----- UI helpers -----
@@ -45,20 +55,19 @@ function setStatus(connected, text) {
 }
 
 function resetStats() {
-  count = 0;
-  sumLatency = 0;
-  minLatency = Infinity;
-  maxLatency = -Infinity;
-  lastLatencyMs = null;
-  latencyPoints.length = 0;
+  latencySamples.length = 0;
+  clockOffsetMs = 0;
   needsRender = true;
 }
 
-// ----- Chart rendering -----
+// ----- Drawing -----
 
-function drawLatencyChart() {
+function drawLatencyChart(values) {
+  const ctx = latencyCtx;
+  const canvas = latencyCanvas;
   const w = canvas.width;
   const h = canvas.height;
+
   ctx.clearRect(0, 0, w, h);
 
   const marginLeft = 40;
@@ -88,19 +97,17 @@ function drawLatencyChart() {
   ctx.lineTo(marginLeft, h - marginBottom);
   ctx.stroke();
 
-  if (!latencyPoints.length) {
+  if (!values.length) {
     ctx.fillStyle = 'rgba(148,163,184,0.7)';
     ctx.font = '12px system-ui';
     ctx.fillText('No data yet…', marginLeft + 10, marginTop + 20);
     return;
   }
 
-  const values = latencyPoints;
   let min = Math.min(...values);
   let max = Math.max(...values);
 
   if (min === max) {
-    // avoid flatline zero range
     const delta = Math.max(1, Math.abs(min) * 0.1);
     min -= delta;
     max += delta;
@@ -110,10 +117,10 @@ function drawLatencyChart() {
   const n = values.length;
   const dx = n > 1 ? plotW / (n - 1) : 0;
 
-  // grid line at avg (window avg, just for the chart)
-  const avgWin = values.reduce((a, b) => a + b, 0) / n;
-  const yAvg =
-    marginTop + plotH - ((avgWin - min) / range) * plotH;
+  const avg = values.reduce((a, b) => a + b, 0) / n;
+  const yAvg = marginTop + plotH - ((avg - min) / range) * plotH;
+
+  // avg grid line
   ctx.strokeStyle = 'rgba(79,209,197,0.3)';
   ctx.setLineDash([4, 4]);
   ctx.beginPath();
@@ -122,11 +129,11 @@ function drawLatencyChart() {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // ticks / labels (min, avgWin, max)
+  // ticks / labels (min, avg, max)
   ctx.fillStyle = 'rgba(148,163,184,0.9)';
   ctx.font = '11px system-ui';
   ctx.fillText(max.toFixed(0) + ' ms', 4, marginTop + 8);
-  ctx.fillText(avgWin.toFixed(0) + ' ms', 4, yAvg + 4);
+  ctx.fillText(avg.toFixed(0) + ' ms', 4, yAvg + 4);
   ctx.fillText(min.toFixed(0) + ' ms', 4, h - marginBottom - 2);
 
   // latency line
@@ -136,8 +143,7 @@ function drawLatencyChart() {
   for (let i = 0; i < n; i++) {
     const x = marginLeft + dx * i;
     const v = values[i];
-    const y =
-      marginTop + plotH - ((v - min) / range) * plotH;
+    const y = marginTop + plotH - ((v - min) / range) * plotH;
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
@@ -151,46 +157,139 @@ function drawLatencyChart() {
   ctx.fill();
 }
 
-function addLatencyPoint(latencyMs) {
-  latencyPoints.push(latencyMs);
-  if (latencyPoints.length > maxPoints) latencyPoints.shift();
+// ----- Data update -----
 
-  lastLatencyMs = latencyMs;
-  count += 1;
-  sumLatency += latencyMs;
-  minLatency = Math.min(minLatency, latencyMs);
-  maxLatency = Math.max(maxLatency, latencyMs);
+function addSample(latencyMs) {
+  const now = Date.now();
+  const v = latencyMs < 0 ? 0 : latencyMs;
 
-  // mark for next rAF frame
+  latencySamples.push({ t: now, v });
+
+  // prune samples older than STATS_WINDOW_MS
+  const threshold = now - STATS_WINDOW_MS;
+  while (latencySamples.length && latencySamples[0].t < threshold) {
+    latencySamples.shift();
+  }
+
   needsRender = true;
 }
 
-// ----- Render loop (batch DOM + canvas at refresh rate) -----
+// ----- Render loop -----
 
 function renderFrame() {
   if (needsRender) {
-    // stats DOM
-    msgCountEl.textContent = String(count);
+    const now = Date.now();
+    const statsFrom = now - STATS_WINDOW_MS;
+    const graphFrom = now - GRAPH_WINDOW_MS;
 
-    if (!count || lastLatencyMs == null) {
+    const last5s = latencySamples.filter((s) => s.t >= statsFrom);
+    const last3s = latencySamples.filter((s) => s.t >= graphFrom);
+
+    // Stats over last 5 seconds
+    if (!last5s.length) {
+      msgCountEl.textContent = '0';
       lastLatencyEl.textContent = '–';
       avgLatencyEl.textContent = '–';
       minMaxLatencyEl.textContent = '–';
     } else {
-      lastLatencyEl.textContent = lastLatencyMs.toFixed(1) + ' ms';
-      avgLatencyEl.textContent =
-        (sumLatency / count).toFixed(1) + ' ms';
+      const values = last5s.map((s) => s.v);
+      const count = values.length;
+      const last = values[values.length - 1];
+      const sum = values.reduce((a, b) => a + b, 0);
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+
+      msgCountEl.textContent = String(count);
+      lastLatencyEl.textContent = last.toFixed(1) + ' ms';
+      avgLatencyEl.textContent = (sum / count).toFixed(1) + ' ms';
       minMaxLatencyEl.textContent =
-        `${minLatency.toFixed(1)} / ${maxLatency.toFixed(1)} ms`;
+        `${min.toFixed(1)} / ${max.toFixed(1)} ms`;
     }
 
-    // chart
-    drawLatencyChart();
+    // Graph over last 3 seconds (raw values)
+    const rawValues = last3s.map((s) => s.v);
+    drawLatencyChart(rawValues);
 
     needsRender = false;
   }
 
   window.requestAnimationFrame(renderFrame);
+}
+
+// ----- Time sync over MQTT (multi-probe NTP-style) -----
+
+function timeSyncProbe(client) {
+  return new Promise((resolve, reject) => {
+    const t1 = Date.now();
+    let settled = false;
+
+    const handler = (topic, payloadStr) => {
+      if (topic !== TIME_SYNC_RESP_TOPIC) return;
+
+      let msg;
+      try {
+        msg = JSON.parse(payloadStr);
+      } catch {
+        return;
+      }
+      if (msg.t1 !== t1) return;
+
+      const t4 = Date.now();
+      const { t2, t3 } = msg;
+      if (typeof t2 !== 'number' || typeof t3 !== 'number') return;
+
+      client.off('message', handler);
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+
+      const offset = ((t2 - t1) + (t3 - t4)) / 2;
+      const delay = (t4 - t1) - (t3 - t2);
+      resolve({ offset, delay });
+    };
+
+    client.on('message', handler);
+
+    const timer = setTimeout(() => {
+      client.off('message', handler);
+      if (settled) return;
+      settled = true;
+      reject(new Error('time sync timeout'));
+    }, 500);
+
+    client.subscribe(TIME_SYNC_RESP_TOPIC).catch(() => {});
+
+    client.publish(
+      TIME_SYNC_REQ_TOPIC,
+      JSON.stringify({ t1 }),
+      0,
+    ).catch(() => {});
+  });
+}
+
+async function runTimeSyncMulti(client, probes = 7) {
+  const results = [];
+
+  for (let i = 0; i < probes; i++) {
+    try {
+      const r = await timeSyncProbe(client);
+      results.push(r);
+    } catch {
+      // ignore failed probe
+    }
+  }
+
+  if (!results.length) {
+    throw new Error('no successful time sync probes');
+  }
+
+  const minDelay = Math.min(...results.map((r) => r.delay));
+  const best = results.filter((r) => r.delay <= minDelay + 1);
+
+  const offsets = best.map((r) => r.offset).sort((a, b) => a - b);
+  const medianOffset = offsets[Math.floor(offsets.length / 2)];
+
+  return { offset: medianOffset, delay: minDelay };
 }
 
 // ----- MQTT / WebTransport wiring -----
@@ -209,35 +308,29 @@ async function connect() {
 
   client = new WebTransportMqttClient(url);
 
+  const telemetryHandler = (msgTopic, payloadStr) => {
+    if (msgTopic !== topic) return;
+
+    let payload;
+    try {
+      payload = JSON.parse(payloadStr);
+    } catch {
+      return;
+    }
+
+    if (typeof payload.ts !== 'number') {
+      return;
+    }
+
+    const arrivalMs = Date.now();
+    const measured = arrivalMs - payload.ts; // client - server
+    const latencyMs = measured + clockOffsetMs; // ~ one-way latency (corrected)
+
+    addSample(latencyMs);
+  };
+
   client
-    // we ignore 'log' / 'suback' events to reduce overhead
-    .on('connect', async () => {
-      setStatus(true, 'Connected');
-      try {
-        await client.subscribe(topic);
-      } catch {
-        // soft-fail; status remains "Connected"
-      }
-    })
-    .on('message', (msgTopic, payloadStr) => {
-      if (msgTopic !== topic) return;
-      let payload;
-      try {
-        payload = JSON.parse(payloadStr);
-      } catch {
-        // invalid payload; ignore
-        return;
-      }
-
-      if (typeof payload.ts !== 'number') {
-        return;
-      }
-
-      const arrivalMs = Date.now();
-      const latencyMs = arrivalMs - payload.ts;
-
-      addLatencyPoint(latencyMs);
-    })
+    .on('message', telemetryHandler)
     .on('close', () => {
       setStatus(false, 'Disconnected');
       client = null;
@@ -245,6 +338,24 @@ async function connect() {
     .on('error', () => {
       setStatus(false, 'Error');
       client = null;
+    })
+    .on('connect', async () => {
+      setStatus(true, 'Connected');
+
+      // multi-probe time sync (best effort)
+      try {
+        const { offset } = await runTimeSyncMulti(client, 7);
+        clockOffsetMs = offset;
+      } catch {
+        clockOffsetMs = 0;
+      }
+
+      // subscribe to telemetry
+      try {
+        await client.subscribe(topic);
+      } catch {
+        // best-effort
+      }
     });
 
   try {
@@ -275,7 +386,7 @@ disconnectBtn.addEventListener('click', () => {
   void disconnect();
 });
 
-// initial render + start rAF loop
-drawLatencyChart();
+// Initial render & start rAF loop
+drawLatencyChart([]);
 setStatus(false, 'Disconnected');
 window.requestAnimationFrame(renderFrame);
